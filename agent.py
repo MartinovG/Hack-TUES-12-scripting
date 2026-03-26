@@ -2,8 +2,14 @@ import os
 import sys
 import shutil
 import platform
-import psutil
 import subprocess
+
+try:
+    import psutil
+except ImportError:
+    print("[*] Missing 'psutil' library. Installing it automatically...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
+    import psutil
 
 def get_system_info():
     os_type = platform.system()
@@ -50,6 +56,51 @@ def get_hardware_profile():
 
     return {"memory": vm_mem, "cpus": vm_cpu}
 
+def check_and_install_dependencies():
+    os_type, is_arm = get_system_info()
+    
+    # Auto-install Vagrant
+    if not shutil.which("vagrant"):
+        print("[*] Vagrant is missing. Attempting to install...")
+        if os_type == "Darwin":
+            subprocess.run(["brew", "install", "hashicorp/tap/hashicorp-vagrant"], check=False)
+        elif os_type == "Linux":
+            subprocess.run(["sudo", "apt-get", "update"], check=False)
+            subprocess.run(["sudo", "apt-get", "install", "-y", "vagrant"], check=False)
+        elif os_type == "Windows":
+            print("[i] Attempting to install Vagrant via winget...")
+            subprocess.run(["winget", "install", "Hashicorp.Vagrant"], shell=True, check=False)
+    
+    # Auto-install Providers (QEMU for ARM, Virtualbox for x86)
+    if is_arm:
+        if not shutil.which("qemu-system-aarch64") and not shutil.which("qemu-system-arm"):
+            print("[*] QEMU is missing. Attempting to install...")
+            if os_type == "Darwin":
+                subprocess.run(["brew", "install", "qemu"], check=False)
+            elif os_type == "Linux":
+                subprocess.run(["sudo", "apt-get", "install", "-y", "qemu-system", "qemu-utils"], check=False)
+        
+        # Check Vagrant QEMU plugin
+        if shutil.which("vagrant"):
+            try:
+                plugins = subprocess.check_output(["vagrant", "plugin", "list"]).decode(errors="ignore")
+                if "vagrant-qemu" not in plugins:
+                    print("[*] Installing 'vagrant-qemu' plugin...")
+                    subprocess.run(["vagrant", "plugin", "install", "vagrant-qemu"], check=False)
+            except Exception as e:
+                print(f"[!] Could not check/install vagrant-qemu plugin: {e}")
+    else:
+        vbox_cmd = "vboxmanage" if os_type != "Windows" else "VBoxManage.exe"
+        if not shutil.which(vbox_cmd) and not shutil.which("VBoxManage"):
+            print("[*] VirtualBox is missing. Attempting to install...")
+            if os_type == "Darwin":
+                subprocess.run(["brew", "install", "--cask", "virtualbox"], check=False)
+            elif os_type == "Linux":
+                subprocess.run(["sudo", "apt-get", "install", "-y", "virtualbox"], check=False)
+            elif os_type == "Windows":
+                print("[i] Attempting to install VirtualBox via winget...")
+                subprocess.run(["winget", "install", "Oracle.VirtualBox"], shell=True, check=False)
+
 def run_vagrant(specs, box_name):
     os_type, is_arm = get_system_info()
     
@@ -68,9 +119,10 @@ def run_vagrant(specs, box_name):
     except Exception as e:
         print(f"[!] Error: {e}")
         if os_type == "Windows":
-            print("[i] Hint: Ensure Vagrant is installed and available in your PATH environment variable.")
+            print("[i] Hint: You may need to restart your terminal after installing dependencies.")
 
 if __name__ == "__main__":
-    selected_box = select_os_menu()
-    hardware = get_hardware_profile()
-    run_vagrant(hardware, selected_box)
+    check_and_install_dependencies()
+    os_opts = select_os_menu()
+    hw_specs = get_hardware_profile()
+    run_vagrant(hw_specs, os_opts)
