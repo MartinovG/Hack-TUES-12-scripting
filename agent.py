@@ -3,6 +3,7 @@ import sys
 import shutil
 import platform
 import subprocess
+import time
 
 try:
     import psutil
@@ -127,9 +128,25 @@ def run_vagrant(specs, box_name):
         if os_type == "Windows":
             print("[i] Hint: You may need to restart your terminal or run it as Administrator.")
 
+def wait_for_activation():
+    flag_file = "state.txt"
+    print(f"[*] Polling for active state... (Waiting for a file named '{flag_file}' to contain 'active')")
+    while True:
+        if os.path.exists(flag_file):
+            try:
+                with open(flag_file, "r") as f:
+                    content = f.read().strip().lower()
+                if content == "active":
+                    print("\n[+] Active state flag detected! Proceeding to OS selection...")
+                    break
+            except Exception:
+                pass
+        time.sleep(2)
+
 if __name__ == "__main__":
     try:
         check_and_install_dependencies()
+        wait_for_activation()
         os_opts = select_os_menu()
         hw_specs = get_hardware_profile()
         run_vagrant(hw_specs, os_opts)
