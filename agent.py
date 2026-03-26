@@ -59,7 +59,6 @@ def get_hardware_profile():
 def check_and_install_dependencies():
     os_type, is_arm = get_system_info()
     
-    # Auto-install Vagrant
     if not shutil.which("vagrant"):
         print("[*] Vagrant is missing. Attempting to install...")
         if os_type == "Darwin":
@@ -71,7 +70,6 @@ def check_and_install_dependencies():
             print("[i] Attempting to install Vagrant via winget...")
             subprocess.run(["winget", "install", "Hashicorp.Vagrant"], shell=True, check=False)
     
-    # Auto-install Providers (QEMU for ARM, Virtualbox for x86)
     if is_arm:
         if not shutil.which("qemu-system-aarch64") and not shutil.which("qemu-system-arm"):
             print("[*] QEMU is missing. Attempting to install...")
@@ -80,7 +78,6 @@ def check_and_install_dependencies():
             elif os_type == "Linux":
                 subprocess.run(["sudo", "apt-get", "install", "-y", "qemu-system", "qemu-utils"], check=False)
         
-        # Check Vagrant QEMU plugin
         if shutil.which("vagrant"):
             try:
                 plugins = subprocess.check_output(["vagrant", "plugin", "list"]).decode(errors="ignore")
@@ -113,6 +110,11 @@ def run_vagrant(specs, box_name):
     vagrant_cmd = shutil.which("vagrant") or "vagrant"
     
     try:
+        status_output = subprocess.check_output([vagrant_cmd, "status"], text=True)
+        if "running" in status_output:
+            print("[*] VM is already running. Skipping provision...")
+            return
+            
         print(f"[*] Provisioning {box_name} using {provider} on {os_type}...")
         subprocess.run([vagrant_cmd, "up", f"--provider={provider}"], env=env, check=True)
         print("[+] VM is live.")
