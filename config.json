@@ -1,0 +1,6 @@
+{
+  "backend_url": "https://YOUR_SERVER",
+  "api_key": "PROVIDER_SECRET",
+  "ssh_user": "backend_user",
+  "backend_ip": "X.X.X.X"
+}
