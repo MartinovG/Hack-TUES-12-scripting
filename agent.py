@@ -96,7 +96,9 @@ def check_and_install_dependencies():
                 subprocess.run(["sudo", "apt-get", "install", "-y", "virtualbox"], check=False)
             elif os_type == "Windows":
                 print("[i] Attempting to install VirtualBox via winget...")
-                subprocess.run(["winget", "install", "Oracle.VirtualBox"], shell=True, check=False)
+                print("[!] Note: VirtualBox install may fail if VCRedist is not installed.")
+                subprocess.run(["winget", "install", "Microsoft.VCRedist.2015+.x64"], shell=True, check=False)
+                subprocess.run(["winget", "install", "Oracle.VirtualBox", "--accept-package-agreements", "--accept-source-agreements"], shell=True, check=False)
 
 def run_vagrant(specs, box_name):
     os_type, is_arm = get_system_info()
