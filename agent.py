@@ -23,16 +23,16 @@ def select_os_menu():
     if is_arm:
         print(f"[!] Detected {os_type} (ARM64). Using ARM-compatible boxes.")
         os_options = {
-            "1": {"name": "Ubuntu 22.04 (ARM64)", "box": "perk/ubuntu-2204-arm64"},
-            "2": {"name": "Debian 12 (ARM64)", "box": "bento/debian-12-arm64"}, 
-            "3": {"name": "Alpine Linux (ARM64)", "box": "generic/alpine316"}
+            "1": {"name": "Alpine Linux (ARM64)", "box": "generic/alpine316"},
+            "2": {"name": "Ubuntu (ARM64)", "box": "perk/ubuntu-2204-arm64"}, 
+            "3": {"name": "Debian 12 (ARM64)", "box": "bento/debian-12-arm64"}
         }
     else:
         print(f"[!] Detected {os_type} (x86_64). Using standard boxes.")
         os_options = {
-            "1": {"name": "Ubuntu 22.04", "box": "ubuntu/jammy64"},
-            "2": {"name": "Debian 12", "box": "debian/bookworm64"},
-            "3": {"name": "Alpine Linux", "box": "generic/alpine316"}
+            "1": {"name": "Alpine Linux", "box": "generic/alpine316"},
+            "2": {"name": "Windows 10", "box": "gusztavvargadr/windows-10"},
+            "3": {"name": "Linux (Ubuntu)", "box": "ubuntu/jammy64"}
         }
 
     print("\n" + "="*30)
@@ -52,12 +52,14 @@ def get_hardware_profile():
     if total_ram_gb >= 16:
         vm_mem, vm_cpu = 4096, max(1, cpu_cores - 2) 
     else:
-        vm_mem, vm_cpu = 1024, 1
+        vm_mem, vm_cpu = 1024, max(1, cpu_cores - 1)
 
+    print(f"[*] Hardware Profile: Allocated {vm_mem}MB RAM and {vm_cpu} CPU core(s) to the VM.")
     return {"memory": vm_mem, "cpus": vm_cpu}
 
 def check_and_install_dependencies():
     os_type, is_arm = get_system_info()
+    print(f"[*] Performing dependency checks for {os_type}...")
     
     if not shutil.which("vagrant"):
         print("[*] Vagrant is missing. Attempting to install...")
@@ -67,8 +69,8 @@ def check_and_install_dependencies():
             subprocess.run(["sudo", "apt-get", "update"], check=False)
             subprocess.run(["sudo", "apt-get", "install", "-y", "vagrant"], check=False)
         elif os_type == "Windows":
-            print("[i] Attempting to install Vagrant via winget...")
-            subprocess.run(["winget", "install", "Hashicorp.Vagrant"], shell=True, check=False)
+            print("[i] Attempting to install Vagrant via winget (Admin prompt will appear)...")
+            subprocess.run(["powershell", "-Command", "Start-Process winget -ArgumentList 'install Hashicorp.Vagrant --accept-package-agreements --accept-source-agreements' -Verb RunAs -Wait"], check=False)
     
     if is_arm:
         if not shutil.which("qemu-system-aarch64") and not shutil.which("qemu-system-arm"):
@@ -95,10 +97,9 @@ def check_and_install_dependencies():
             elif os_type == "Linux":
                 subprocess.run(["sudo", "apt-get", "install", "-y", "virtualbox"], check=False)
             elif os_type == "Windows":
-                print("[i] Attempting to install VirtualBox via winget...")
-                print("[!] Note: VirtualBox install may fail if VCRedist is not installed.")
-                subprocess.run(["winget", "install", "Microsoft.VCRedist.2015+.x64"], shell=True, check=False)
-                subprocess.run(["winget", "install", "Oracle.VirtualBox", "--accept-package-agreements", "--accept-source-agreements"], shell=True, check=False)
+                print("[i] Attempting to install VirtualBox via winget (Admin prompts will appear)...")
+                subprocess.run(["powershell", "-Command", "Start-Process winget -ArgumentList 'install Microsoft.VCRedist.2015+.x64 --accept-package-agreements --accept-source-agreements --silent' -Verb RunAs -Wait"], check=False)
+                subprocess.run(["powershell", "-Command", "Start-Process winget -ArgumentList 'install Oracle.VirtualBox --accept-package-agreements --accept-source-agreements --silent' -Verb RunAs -Wait"], check=False)
 
 def run_vagrant(specs, box_name):
     os_type, is_arm = get_system_info()
@@ -115,18 +116,23 @@ def run_vagrant(specs, box_name):
         status_output = subprocess.check_output([vagrant_cmd, "status"], text=True)
         if "running" in status_output:
             print("[*] VM is already running. Skipping provision...")
+            print("[i] Hint: You can use 'vagrant ssh' to connect to the VM.")
             return
             
         print(f"[*] Provisioning {box_name} using {provider} on {os_type}...")
         subprocess.run([vagrant_cmd, "up", f"--provider={provider}"], env=env, check=True)
-        print("[+] VM is live.")
+        print("[+] VM is live. You can connect using: vagrant ssh")
     except Exception as e:
-        print(f"[!] Error: {e}")
+        print(f"[!] Target error: {e}")
         if os_type == "Windows":
-            print("[i] Hint: You may need to restart your terminal after installing dependencies.")
+            print("[i] Hint: You may need to restart your terminal or run it as Administrator.")
 
 if __name__ == "__main__":
-    check_and_install_dependencies()
-    os_opts = select_os_menu()
-    hw_specs = get_hardware_profile()
-    run_vagrant(hw_specs, os_opts)
+    try:
+        check_and_install_dependencies()
+        os_opts = select_os_menu()
+        hw_specs = get_hardware_profile()
+        run_vagrant(hw_specs, os_opts)
+    except KeyboardInterrupt:
+        print("\n[!] Operation cancelled by user.")
+        sys.exit(0)
