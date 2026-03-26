@@ -5,12 +5,43 @@ import platform
 import subprocess
 import time
 
+import asyncio
+import websockets
+
 try:
     import psutil
 except ImportError:
     print("[*] Missing 'psutil' library. Installing it automatically...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
     import psutil
+
+BACKEND_URL = "ws://localhost:8765"
+
+async def connect_to_websocket():
+    while True:
+        try:
+            print(f"[*] Attempting to connect to {BACKEND_URL}...")
+            async with websockets.connect(
+                BACKEND_URL,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=10
+            ) as websocket:
+                print("[+] Connected to server.")
+                
+                await websocket.send(f"Client Node: {platform.node()} is active")
+
+                while True:
+                    try:
+                        response = await websocket.recv()
+                        print(f"[*] Message from server: {response}")
+                    except websockets.exceptions.ConnectionClosed:
+                        print("[!] Connection closed by server. Retrying...")
+                        break 
+        
+        except (OSError, websockets.exceptions.InvalidURI, Exception) as e:
+            print(f"[!] Connection failed: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5) 
 
 def get_system_info():
     os_type = platform.system()
@@ -90,17 +121,27 @@ def check_and_install_dependencies():
             except Exception as e:
                 print(f"[!] Could not check/install vagrant-qemu plugin: {e}")
     else:
-        vbox_cmd = "vboxmanage" if os_type != "Windows" else "VBoxManage.exe"
-        if not shutil.which(vbox_cmd) and not shutil.which("VBoxManage"):
-            print("[*] VirtualBox is missing. Attempting to install...")
-            if os_type == "Darwin":
+        if os_type == "Windows":
+            print("[i] Ensuring Windows Hyper-V is enabled for optimal performance...")
+            subprocess.run(["powershell", "-Command", "Start-Process powershell -ArgumentList 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart' -Verb RunAs -Wait"], check=False)
+        elif os_type == "Linux":
+            if not shutil.which("virsh"):
+                print("[*] KVM/Libvirt is missing. Attempting to install for optimal performance...")
+                subprocess.run(["sudo", "apt-get", "install", "-y", "qemu-kvm", "libvirt-daemon-system", "libvirt-clients", "bridge-utils"], check=False)
+            
+            if shutil.which("vagrant"):
+                try:
+                    plugins = subprocess.check_output(["vagrant", "plugin", "list"]).decode(errors="ignore")
+                    if "vagrant-libvirt" not in plugins:
+                        print("[*] Installing 'vagrant-libvirt' plugin...")
+                        subprocess.run(["vagrant", "plugin", "install", "vagrant-libvirt"], check=False)
+                except Exception as e:
+                    print(f"[!] Could not check/install vagrant-libvirt plugin: {e}")
+        elif os_type == "Darwin":
+            vbox_cmd = "vboxmanage"
+            if not shutil.which(vbox_cmd) and not shutil.which("VBoxManage"):
+                print("[*] VirtualBox is missing. Attempting to install...")
                 subprocess.run(["brew", "install", "--cask", "virtualbox"], check=False)
-            elif os_type == "Linux":
-                subprocess.run(["sudo", "apt-get", "install", "-y", "virtualbox"], check=False)
-            elif os_type == "Windows":
-                print("[i] Attempting to install VirtualBox via winget (Admin prompts will appear)...")
-                subprocess.run(["powershell", "-Command", "Start-Process winget -ArgumentList 'install Microsoft.VCRedist.2015+.x64 --accept-package-agreements --accept-source-agreements --silent' -Verb RunAs -Wait"], check=False)
-                subprocess.run(["powershell", "-Command", "Start-Process winget -ArgumentList 'install Oracle.VirtualBox --accept-package-agreements --accept-source-agreements --silent' -Verb RunAs -Wait"], check=False)
 
 def run_vagrant(specs, box_name):
     os_type, is_arm = get_system_info()
@@ -110,7 +151,16 @@ def run_vagrant(specs, box_name):
     env["HIVE_VM_CPU"] = str(specs["cpus"])
     env["HIVE_VM_BOX"] = box_name 
     
-    provider = "qemu" if is_arm else "virtualbox"
+    if is_arm:
+        provider = "qemu"
+    else:
+        if os_type == "Windows":
+            provider = "hyperv"
+        elif os_type == "Linux":
+            provider = "libvirt"
+        else:
+            provider = "virtualbox"  
+            
     vagrant_cmd = shutil.which("vagrant") or "vagrant"
     
     try:
@@ -118,15 +168,20 @@ def run_vagrant(specs, box_name):
         if "running" in status_output:
             print("[*] VM is already running. Skipping provision...")
             print("[i] Hint: You can use 'vagrant ssh' to connect to the VM.")
-            return
+            return True
             
         print(f"[*] Provisioning {box_name} using {provider} on {os_type}...")
         subprocess.run([vagrant_cmd, "up", f"--provider={provider}"], env=env, check=True)
         print("[+] VM is live. You can connect using: vagrant ssh")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[!] Vagrant process returned non-zero exit status: {e.returncode}")
+        return False
     except Exception as e:
         print(f"[!] Target error: {e}")
         if os_type == "Windows":
             print("[i] Hint: You may need to restart your terminal or run it as Administrator.")
+        return False
 
 def wait_for_activation():
     flag_file = "state.txt"
@@ -149,7 +204,15 @@ if __name__ == "__main__":
         wait_for_activation()
         os_opts = select_os_menu()
         hw_specs = get_hardware_profile()
-        run_vagrant(hw_specs, os_opts)
+        
+        success = run_vagrant(hw_specs, os_opts)
+        
+        if not success:
+            print("[!] VM boot failed/was interrupted. Proceeding to websocket layer anyway...")
+        else:
+            print("[+] Provisioning complete. Keeping websocket connection active...")
+            
+        asyncio.run(connect_to_websocket())
     except KeyboardInterrupt:
         print("\n[!] Operation cancelled by user.")
         sys.exit(0)
