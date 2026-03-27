@@ -12,7 +12,7 @@ import uuid
 import psutil
 import socketio
 
-BACKEND_URL = os.getenv("HIVE_BACKEND_URL", "http://localhost:3000")
+BACKEND_URL = os.getenv("HIVE_BACKEND_URL", "").strip()
 SOCKET_PATH = os.getenv("HIVE_SOCKET_PATH", "/computer-socket")
 CONNECTION_TOKEN = os.getenv("HIVE_CONNECTION_TOKEN", "").strip()
 HEARTBEAT_INTERVAL = int(os.getenv("HIVE_HEARTBEAT_INTERVAL", "30"))
@@ -177,6 +177,19 @@ def resolve_connection_token():
         if provided:
             return provided
         print("[!] A setup key is required to register this provider machine.")
+
+
+def resolve_backend_url():
+    if BACKEND_URL:
+        return BACKEND_URL.rstrip("/")
+
+    print("[*] Enter the backend URL for your hosted Share A Comp API.")
+
+    while True:
+        provided = input("Backend URL: ").strip()
+        if provided:
+            return provided.rstrip("/")
+        print("[!] A backend URL is required, for example: https://api.your-domain.com")
 
 
 async def heartbeat_loop():
@@ -636,6 +649,7 @@ async def connect_to_backend():
 if __name__ == "__main__":
     try:
         CONNECTION_TOKEN = resolve_connection_token()
+        BACKEND_URL = resolve_backend_url()
         check_and_install_dependencies()
         log("INFO", "Starting remote Hive Agent lifecycle debug copy...")
         log("INFO", f"Backend URL: {BACKEND_URL}")
