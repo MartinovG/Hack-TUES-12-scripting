@@ -4,6 +4,10 @@ import shutil
 import platform
 import subprocess
 import time
+import json
+import base64
+import datetime
+import uuid
 
 import asyncio
 import websockets
@@ -16,8 +20,94 @@ except ImportError:
     import psutil
 
 BACKEND_URL = "ws://localhost:8765"
+current_vm_id = None
+
+async def run_command_in_vm(command: str) -> dict:
+    """Run a single command inside the Vagrant VM and return a structured result."""
+    try:
+        result = subprocess.run(
+            ["vagrant", "ssh", "-c", command],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return {"success": True, "stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+    except subprocess.CalledProcessError as e:
+        return {"success": False, "stdout": e.stdout.strip() if e.stdout else "", "stderr": e.stderr.strip() if e.stderr else "", "code": e.returncode}
+    except Exception as exc:
+        return {"success": False, "stdout": "", "stderr": str(exc)}
+
+
+def _os_options_map(is_arm: bool):
+    if is_arm:
+        return {
+            "1": "generic/alpine316",
+            "2": "perk/ubuntu-2204-arm64",
+            "3": "bento/debian-12-arm64"
+        }
+    else:
+        return {
+            "1": "generic/alpine316",
+            "2": "gusztavvargadr/windows-10",
+            "3": "ubuntu/jammy64"
+        }
+
+
+def _resolve_box_choice(choice, is_arm: bool):
+    # Accept either an index string/number or a direct box name
+    if isinstance(choice, int):
+        choice = str(choice)
+    if not choice:
+        return None
+    mapping = _os_options_map(is_arm)
+    # If user sent an index
+    if isinstance(choice, str) and choice in mapping:
+        return mapping[choice]
+    # If looks like a vagrant box name, return as-is
+    if isinstance(choice, str) and "/" in choice:
+        return choice
+    return None
+
+def get_vagrant_ssh_info():
+    """Extract VM SSH credentials dynamically via vagrant ssh-config."""
+    info = {
+        "ip_address": "127.0.0.1",
+        "ssh_port": 2222,
+        "ssh_username": "vagrant",
+        "ssh_private_key_path": ""
+    }
+    try:
+        result = subprocess.run(["vagrant", "ssh-config"], capture_output=True, text=True, check=True)
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if line.startswith("HostName "): info["ip_address"] = line.split()[1]
+            elif line.startswith("Port "): info["ssh_port"] = int(line.split()[1])
+            elif line.startswith("User "): info["ssh_username"] = line.split()[1]
+            elif line.startswith("IdentityFile "): info["ssh_private_key_path"] = line.split()[1]
+    except Exception:
+        pass
+    return info
+
+async def heartbeat_loop(websocket):
+    """Sends a heartbeat every 30 seconds back to the server."""
+    global current_vm_id
+    while True:
+        await asyncio.sleep(30)
+        try:
+            payload = {
+                "action": "heartbeat",
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "status": "healthy",
+                "active_vms": [current_vm_id] if current_vm_id else []
+            }
+            await websocket.send(json.dumps(payload))
+        except websockets.exceptions.ConnectionClosed:
+            break
+        except Exception as e:
+            print(f"[!] Heartbeat error: {e}")
 
 async def connect_to_websocket():
+    global current_vm_id
     while True:
         try:
             print(f"[*] Attempting to connect to {BACKEND_URL}...")
@@ -28,17 +118,199 @@ async def connect_to_websocket():
                 close_timeout=10
             ) as websocket:
                 print("[+] Connected to server.")
-                
-                await websocket.send(f"Client Node: {platform.node()} is active")
 
-                while True:
+                # Retrieve real system metrics
+                capabilities = {
+                    "cpu_cores": psutil.cpu_count(logical=False),
+                    "ram_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+                    "storage_gb": round(shutil.disk_usage('/').free / (1024**3), 2),
+                    "os": platform.system()
+                }
+
+                # 1. Connection & Registration
+                await websocket.send(json.dumps({
+                    "action": "client_connected",
+                    "hostname": platform.node(),
+                    "connection_token": "agent-default-token",
+                    "capabilities": capabilities
+                }))
+
+                # Start heartbeat in background
+                asyncio.create_task(heartbeat_loop(websocket))
+
+                async for message in websocket:
+                    print(f"\n[*] Message from server: {message}")
                     try:
-                        response = await websocket.recv()
-                        print(f"[*] Message from server: {response}")
-                    except websockets.exceptions.ConnectionClosed:
-                        print("[!] Connection closed by server. Retrying...")
-                        break 
-        
+                        data = json.loads(message)
+                    except Exception:
+                        continue
+
+                    action = data.get("action")
+                    vm_id = data.get("vm_id")
+
+                    if action == "provision_vm":
+                        current_vm_id = vm_id
+                        await websocket.send(json.dumps({
+                            "action": "vm_provisioning_started",
+                            "vm_id": vm_id,
+                            "status": "building",
+                            "message": "Starting Vagrant up..."
+                        }))
+
+                        is_arm = ('arm' in platform.machine().lower() or 'aarch64' in platform.machine().lower())
+                        box_name = _resolve_box_choice(data.get("os_choice"), is_arm)
+
+                        specs = data.get("specs", {})
+                        if not specs.get("memory"):
+                            host_specs = get_hardware_profile()
+                            specs["memory"] = host_specs["memory"]
+                            specs["cpus"] = host_specs["cpus"]
+
+                        loop = asyncio.get_running_loop()
+                        success = await loop.run_in_executor(None, run_vagrant, specs, box_name)
+
+                        if success:
+                            ssh_info = await asyncio.to_thread(get_vagrant_ssh_info)
+                            await websocket.send(json.dumps({
+                                "action": "vm_provisioned",
+                                "vm_id": vm_id,
+                                "status": "running",
+                                "vm_info": ssh_info
+                            }))
+                        else:
+                            await websocket.send(json.dumps({
+                                "action": "vm_provisioning_failed",
+                                "vm_id": vm_id,
+                                "status": "failed",
+                                "error": "Vagrant provisioning returned exit code 1"
+                            }))
+
+                    elif action == "execute_file":
+                        job_id = data.get("job_id")
+                        filename = data.get("exec_filename", "payload.bin")
+                        content_b64 = data.get("exec_file", "")
+                        exec_command = data.get("exec_command", f"chmod +x /home/vagrant/{filename} && /home/vagrant/{filename}")
+                        
+                        await websocket.send(json.dumps({
+                            "action": "execution_started",
+                            "job_id": job_id,
+                            "vm_id": vm_id,
+                            "status": "running",
+                            "message": f"File uploaded, preparing to execute {filename}..."
+                        }))
+
+                        try:
+                            file_content = base64.b64decode(content_b64)
+                            local_path = os.path.join(os.getcwd(), filename)
+                            remote_path = data.get("working_directory", "/home/vagrant") + f"/{filename}"
+                            
+                            with open(local_path, "wb") as f:
+                                f.write(file_content)
+                                
+                            upload_proc = subprocess.run(["vagrant", "upload", local_path, remote_path], capture_output=True, text=True)
+                            
+                            start_time = time.time()
+                            result = await asyncio.to_thread(run_command_in_vm, exec_command)
+                            exec_time = time.time() - start_time
+
+                            if os.path.exists(local_path):
+                                os.remove(local_path)
+                                
+                            if result.get("success"):
+                                await websocket.send(json.dumps({
+                                    "action": "execution_completed",
+                                    "job_id": job_id,
+                                    "vm_id": vm_id,
+                                    "status": "completed",
+                                    "exit_code": 0,
+                                    "stdout": result.get("stdout", ""),
+                                    "stderr": result.get("stderr", ""),
+                                    "execution_time": round(exec_time, 2)
+                                }))
+                            else:
+                                await websocket.send(json.dumps({
+                                    "action": "execution_failed",
+                                    "job_id": job_id,
+                                    "vm_id": vm_id,
+                                    "status": "failed",
+                                    "error": "Command failed",
+                                    "exit_code": result.get("code", 1),
+                                    "stderr": result.get("stderr", "")
+                                }))
+                        except Exception as e:
+                            await websocket.send(json.dumps({
+                                "action": "execution_failed",
+                                "job_id": job_id,
+                                "vm_id": vm_id,
+                                "status": "failed",
+                                "error": str(e),
+                                "exit_code": -1,
+                                "stderr": ""
+                            }))
+                            
+                    elif action == "stop_vm":
+                        print(f"[*] Stopping VM {vm_id}...")
+                        subprocess.run(["vagrant", "halt"], check=False)
+                        await websocket.send(json.dumps({
+                            "action": "vm_stopped",
+                            "vm_id": vm_id,
+                            "status": "stopped"
+                        }))
+                        
+                    elif action == "destroy_vm":
+                        print(f"[*] Destroying VM {vm_id}...")
+                        subprocess.run(["vagrant", "destroy", "-f"], check=False)
+                        current_vm_id = None
+                        await websocket.send(json.dumps({
+                            "action": "vm_destroyed",
+                            "vm_id": vm_id,
+                            "status": "destroyed"
+                        }))
+
+                    elif action == "upload_file_to_vm":
+                        file_id = data.get("file_id")
+                        content_b64 = data.get("file_content", "")
+                        dest_path = data.get("destination_path", "/home/vagrant/uploaded_file")
+                        
+                        try:
+                            local_tmp = f"tmp_upload_{uuid.uuid4().hex}"
+                            with open(local_tmp, "wb") as f:
+                                f.write(base64.b64decode(content_b64))
+                            subprocess.run(["vagrant", "upload", local_tmp, dest_path], check=True)
+                            os.remove(local_tmp)
+                            
+                            # Optional permissions set
+                            perms = data.get("permissions")
+                            if perms:
+                                await asyncio.to_thread(run_command_in_vm, f"chmod {perms} {dest_path}")
+                                
+                            await websocket.send(json.dumps({
+                                "action": "file_uploaded",
+                                "file_id": file_id,
+                                "vm_id": vm_id,
+                                "status": "success",
+                                "path": dest_path
+                            }))
+                        except Exception as e:
+                            await websocket.send(json.dumps({"action": "error_occurred", "error_type": "upload_failed", "vm_id": vm_id, "message": str(e), "recoverable": True}))
+
+                    elif action == "download_file_from_vm":
+                        file_id = data.get("file_id")
+                        source_path = data.get("source_path")
+                        # Read file as base64 right from the VM via SSH
+                        result = await asyncio.to_thread(run_command_in_vm, f"base64 {source_path}")
+                        if result.get("success"):
+                            chunk = result["stdout"].replace("\n", "").replace("\r", "")
+                            await websocket.send(json.dumps({
+                                "action": "file_downloaded",
+                                "file_id": file_id,
+                                "vm_id": vm_id,
+                                "file_content": chunk,
+                                "file_size": len(base64.b64decode(chunk))
+                            }))
+                        else:
+                            await websocket.send(json.dumps({"action": "error_occurred", "error_type": "download_failed", "vm_id": vm_id, "message": result.get("stderr", "Unknown error"), "recoverable": True}))
+
         except (OSError, websockets.exceptions.InvalidURI, Exception) as e:
             print(f"[!] Connection failed: {e}. Retrying in 5 seconds...")
             await asyncio.sleep(5) 
