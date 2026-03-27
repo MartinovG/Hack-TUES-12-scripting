@@ -20,6 +20,7 @@ RECONNECT_DELAY_SECONDS = int(os.getenv("HIVE_RECONNECT_DELAY", "5"))
 
 current_vm_id = None
 heartbeat_task = None
+registration_confirmed = False
 
 sio = socketio.AsyncClient(
     reconnection=True,
@@ -27,6 +28,11 @@ sio = socketio.AsyncClient(
     reconnection_delay=RECONNECT_DELAY_SECONDS,
     reconnection_delay_max=RECONNECT_DELAY_SECONDS,
 )
+
+
+def log(level: str, message: str):
+    timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+    print(f"[{timestamp}] [{level}] {message}")
 
 
 async def run_command_in_vm(command: str) -> dict:
@@ -60,11 +66,22 @@ def _os_options_map(is_arm: bool):
             "1": "generic/alpine316",
             "2": "perk/ubuntu-2204-arm64",
             "3": "bento/debian-12-arm64",
+            "alpine linux (arm64)": "generic/alpine316",
+            "ubuntu (arm64)": "perk/ubuntu-2204-arm64",
+            "ubuntu 24.04 lts": "perk/ubuntu-2204-arm64",
+            "debian 12 (arm64)": "bento/debian-12-arm64",
         }
     return {
         "1": "generic/alpine316",
         "2": "gusztavvargadr/windows-10",
         "3": "ubuntu/jammy64",
+        "alpine linux": "generic/alpine316",
+        "windows 10": "gusztavvargadr/windows-10",
+        "windows 11 pro": "gusztavvargadr/windows-10",
+        "linux (ubuntu)": "ubuntu/jammy64",
+        "ubuntu 24.04 lts": "ubuntu/jammy64",
+        "linux mint 22": "ubuntu/jammy64",
+        "fedora workstation 41": "ubuntu/jammy64",
     }
 
 
@@ -76,6 +93,10 @@ def _resolve_box_choice(choice, is_arm: bool):
     mapping = _os_options_map(is_arm)
     if isinstance(choice, str) and choice in mapping:
         return mapping[choice]
+    if isinstance(choice, str):
+        normalized_choice = choice.strip().lower()
+        if normalized_choice in mapping:
+            return mapping[normalized_choice]
     if isinstance(choice, str) and "/" in choice:
         return choice
     return None
@@ -160,10 +181,10 @@ def resolve_connection_token():
 
 async def heartbeat_loop():
     """Send periodic heartbeats while connected."""
-    global current_vm_id
+    global current_vm_id, registration_confirmed
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
-        if not sio.connected:
+        if not sio.connected or not registration_confirmed:
             continue
 
         payload = {
@@ -175,27 +196,89 @@ async def heartbeat_loop():
 
         try:
             await sio.emit("heartbeat", payload)
-            print("[*] Heartbeat sent.")
+            log("INFO", f"Heartbeat sent. Active VM: {current_vm_id or 'none'}")
         except Exception as error:
-            print(f"[!] Heartbeat error: {error}")
+            log("ERROR", f"Heartbeat error: {error}")
 
 
 def check_and_install_dependencies():
     os_type, is_arm = get_system_info()
-    print(f"[*] Performing dependency checks for {os_type}...")
+    log("INFO", f"Performing dependency checks for {os_type}...")
 
     if not shutil.which("vagrant"):
-        print("[!] Vagrant is not installed. Provisioning commands will fail until it is installed.")
+        log("WARN", "Vagrant is missing. Attempting to install it automatically...")
+        if os_type == "Darwin":
+            subprocess.run(["brew", "install", "hashicorp/tap/hashicorp-vagrant"], check=False)
+        elif os_type == "Linux":
+            subprocess.run(["sudo", "apt-get", "update"], check=False)
+            subprocess.run(["sudo", "apt-get", "install", "-y", "vagrant"], check=False)
+        elif os_type == "Windows":
+            log("INFO", "Attempting to install Vagrant via winget. An administrator prompt may appear.")
+            subprocess.run(
+                [
+                    "powershell",
+                    "-Command",
+                    "Start-Process winget -ArgumentList 'install Hashicorp.Vagrant --accept-package-agreements --accept-source-agreements' -Verb RunAs -Wait",
+                ],
+                check=False,
+            )
 
     if is_arm:
         if not shutil.which("qemu-system-aarch64") and not shutil.which("qemu-system-arm"):
-            print("[!] QEMU is not installed. ARM-based Vagrant providers may fail.")
+            log("WARN", "QEMU is missing. Attempting to install it automatically...")
+            if os_type == "Darwin":
+                subprocess.run(["brew", "install", "qemu"], check=False)
+            elif os_type == "Linux":
+                subprocess.run(["sudo", "apt-get", "install", "-y", "qemu-system", "qemu-utils"], check=False)
+
+        if shutil.which("vagrant"):
+            try:
+                plugins = subprocess.check_output(["vagrant", "plugin", "list"]).decode(errors="ignore")
+                if "vagrant-qemu" not in plugins:
+                    log("INFO", "Installing the vagrant-qemu plugin...")
+                    subprocess.run(["vagrant", "plugin", "install", "vagrant-qemu"], check=False)
+            except Exception as error:
+                log("WARN", f"Could not check or install vagrant-qemu: {error}")
     else:
-        if os_type == "Linux" and not shutil.which("virsh"):
-            print("[!] libvirt is not installed. Linux provisioning may fail until it is installed.")
+        if os_type == "Windows":
+            log("INFO", "Ensuring Hyper-V is enabled on Windows for Vagrant.")
+            subprocess.run(
+                [
+                    "powershell",
+                    "-Command",
+                    "Start-Process powershell -ArgumentList 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart' -Verb RunAs -Wait",
+                ],
+                check=False,
+            )
+        elif os_type == "Linux":
+            if not shutil.which("virsh"):
+                log("WARN", "libvirt is missing. Attempting to install KVM/libvirt support...")
+                subprocess.run(
+                    [
+                        "sudo",
+                        "apt-get",
+                        "install",
+                        "-y",
+                        "qemu-kvm",
+                        "libvirt-daemon-system",
+                        "libvirt-clients",
+                        "bridge-utils",
+                    ],
+                    check=False,
+                )
+
+            if shutil.which("vagrant"):
+                try:
+                    plugins = subprocess.check_output(["vagrant", "plugin", "list"]).decode(errors="ignore")
+                    if "vagrant-libvirt" not in plugins:
+                        log("INFO", "Installing the vagrant-libvirt plugin...")
+                        subprocess.run(["vagrant", "plugin", "install", "vagrant-libvirt"], check=False)
+                except Exception as error:
+                    log("WARN", f"Could not check or install vagrant-libvirt: {error}")
         elif os_type == "Darwin":
             if not shutil.which("vboxmanage") and not shutil.which("VBoxManage"):
-                print("[!] VirtualBox is not installed. macOS provisioning may fail.")
+                log("WARN", "VirtualBox is missing. Attempting to install it automatically...")
+                subprocess.run(["brew", "install", "--cask", "virtualbox"], check=False)
 
 
 def run_vagrant(specs, box_name):
@@ -220,29 +303,33 @@ def run_vagrant(specs, box_name):
 
     try:
         status_output = subprocess.check_output([vagrant_cmd, "status"], text=True)
-        if "running" in status_output:
-            print("[*] VM is already running. Skipping provision...")
-            print("[i] Hint: You can use 'vagrant ssh' to connect to the VM.")
-            return True
+        normalized_status = status_output.lower()
+        if any(state in normalized_status for state in ("running", "poweroff", "saved", "aborted")):
+            log("WARN", "Existing Vagrant environment detected. Destroying it for a clean provisioning cycle.")
+            subprocess.run([vagrant_cmd, "destroy", "-f"], env=env, check=True)
 
-        print(f"[*] Provisioning {box_name} using {provider} on {os_type}...")
+        log(
+            "INFO",
+            f"Provisioning box {box_name or 'default'} using provider {provider} on {os_type} with specs {specs}",
+        )
         subprocess.run([vagrant_cmd, "up", f"--provider={provider}"], env=env, check=True)
-        print("[+] VM is live. You can connect using: vagrant ssh")
+        log("INFO", "Vagrant reported the VM is live.")
         return True
     except subprocess.CalledProcessError as error:
-        print(f"[!] Vagrant process returned non-zero exit status: {error.returncode}")
+        log("ERROR", f"Vagrant process returned non-zero exit status: {error.returncode}")
         return False
     except Exception as error:
-        print(f"[!] Target error: {error}")
+        log("ERROR", f"Provisioning target error: {error}")
         if os_type == "Windows":
-            print("[i] Hint: You may need to restart your terminal or run it as Administrator.")
+            log("INFO", "Hint: You may need to restart your terminal or run it as Administrator.")
         return False
 
 
 @sio.event
 async def connect():
-    global heartbeat_task
-    print("[+] Connected to NestJS backend.")
+    global heartbeat_task, registration_confirmed
+    registration_confirmed = False
+    log("INFO", "Connected to NestJS backend. Sending registration payload...")
 
     await sio.emit(
         "client_connected",
@@ -254,30 +341,36 @@ async def connect():
         },
     )
 
-    if heartbeat_task is None or heartbeat_task.done():
-        heartbeat_task = asyncio.create_task(heartbeat_loop())
-
 
 @sio.event
 def disconnect():
-    print("[!] Disconnected from NestJS backend.")
+    global registration_confirmed
+    registration_confirmed = False
+    log("WARN", "Disconnected from NestJS backend.")
 
 
 @sio.on("connection_acknowledged")
 def on_connection_acknowledged(payload):
-    print(f"[+] Registration acknowledged: {payload}")
+    global heartbeat_task, registration_confirmed, current_vm_id
+    registration_confirmed = True
+    current_vm_id = payload.get("vm_id") or current_vm_id
+    log("INFO", f"Registration acknowledged: {payload}")
+
+    if heartbeat_task is None or heartbeat_task.done():
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        log("INFO", "Heartbeat loop started after successful registration acknowledgment.")
 
 
 @sio.on("error")
 def on_error(payload):
-    print(f"[!] Backend error event: {payload}")
+    log("ERROR", f"Backend error event: {payload}")
 
 
 @sio.on("provision_vm")
 async def on_provision_vm(data):
     global current_vm_id
     current_vm_id = data.get("vm_id")
-    print(f"[*] Received provision_vm event: {data}")
+    log("INFO", f"Received provision_vm event: {data}")
 
     await sio.emit(
         "vm_provisioning_started",
@@ -291,6 +384,18 @@ async def on_provision_vm(data):
 
     is_arm = "arm" in platform.machine().lower() or "aarch64" in platform.machine().lower()
     box_name = _resolve_box_choice(data.get("os_choice"), is_arm)
+    if not box_name:
+        log("ERROR", f"Could not resolve a Vagrant box from os_choice={data.get('os_choice')}")
+        await sio.emit(
+            "vm_provisioning_failed",
+            {
+                "action": "vm_provisioning_failed",
+                "vm_id": current_vm_id,
+                "status": "failed",
+                "error": "Unsupported OS choice for provisioning",
+            },
+        )
+        return
 
     specs = data.get("specs", {})
     if not specs.get("memory"):
@@ -303,6 +408,7 @@ async def on_provision_vm(data):
 
     if success:
         ssh_info = await asyncio.to_thread(get_vagrant_ssh_info)
+        log("INFO", f"Provisioning succeeded for VM {current_vm_id}. SSH info: {ssh_info}")
         await sio.emit(
             "vm_provisioned",
             {
@@ -313,6 +419,7 @@ async def on_provision_vm(data):
             },
         )
     else:
+        log("ERROR", f"Provisioning failed for VM {current_vm_id}")
         await sio.emit(
             "vm_provisioning_failed",
             {
@@ -326,7 +433,7 @@ async def on_provision_vm(data):
 
 @sio.on("execute_file")
 async def on_execute_file(data):
-    print(f"[*] Received execute_file event: {data}")
+    log("INFO", f"Received execute_file event for job {data.get('job_id')}")
     vm_id = data.get("vm_id")
     job_id = data.get("job_id")
     filename = data.get("exec_filename", "payload.bin")
@@ -413,9 +520,11 @@ async def on_execute_file(data):
 
 @sio.on("stop_vm")
 async def on_stop_vm(data):
+    global current_vm_id
     vm_id = data.get("vm_id")
-    print(f"[*] Stopping VM {vm_id}...")
+    log("INFO", f"Stopping VM {vm_id}...")
     subprocess.run(["vagrant", "halt"], check=False)
+    current_vm_id = None
     await sio.emit(
         "vm_stopped",
         {"action": "vm_stopped", "vm_id": vm_id, "status": "stopped"},
@@ -426,7 +535,7 @@ async def on_stop_vm(data):
 async def on_destroy_vm(data):
     global current_vm_id
     vm_id = data.get("vm_id")
-    print(f"[*] Destroying VM {vm_id}...")
+    log("INFO", f"Destroying VM {vm_id}...")
     subprocess.run(["vagrant", "destroy", "-f"], check=False)
     current_vm_id = None
     await sio.emit(
@@ -509,7 +618,7 @@ async def on_download_file_from_vm(data):
 async def connect_to_backend():
     while True:
         try:
-            print(f"[*] Attempting to connect to {BACKEND_URL} using path {SOCKET_PATH}...")
+            log("INFO", f"Attempting to connect to {BACKEND_URL} using path {SOCKET_PATH}...")
             await sio.connect(
                 BACKEND_URL,
                 socketio_path=SOCKET_PATH.lstrip("/"),
@@ -517,7 +626,10 @@ async def connect_to_backend():
             )
             await sio.wait()
         except Exception as error:
-            print(f"[!] Connection failed: {error}. Retrying in {RECONNECT_DELAY_SECONDS} seconds...")
+            log(
+                "ERROR",
+                f"Connection failed: {error}. Retrying in {RECONNECT_DELAY_SECONDS} seconds...",
+            )
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
 
@@ -525,12 +637,12 @@ if __name__ == "__main__":
     try:
         CONNECTION_TOKEN = resolve_connection_token()
         check_and_install_dependencies()
-        print("[*] Starting remote Hive Agent...")
-        print(f"[*] Backend URL: {BACKEND_URL}")
-        print(f"[*] Socket path: {SOCKET_PATH}")
-        print(f"[*] Using setup key: {CONNECTION_TOKEN}")
-        print("[*] Environment initialized. Proceeding to websocket layer...")
+        log("INFO", "Starting remote Hive Agent lifecycle debug copy...")
+        log("INFO", f"Backend URL: {BACKEND_URL}")
+        log("INFO", f"Socket path: {SOCKET_PATH}")
+        log("INFO", f"Using setup key: {CONNECTION_TOKEN}")
+        log("INFO", "Environment initialized. Proceeding to websocket layer...")
         asyncio.run(connect_to_backend())
     except KeyboardInterrupt:
-        print("\n[!] Operation cancelled by user.")
+        log("WARN", "Operation cancelled by user.")
         sys.exit(0)
