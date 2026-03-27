@@ -455,35 +455,13 @@ def run_vagrant(specs, box_name):
             print("[i] Hint: You may need to restart your terminal or run it as Administrator.")
         return False
 
-def wait_for_activation():
-    flag_file = "state.txt"
-    print(f"[*] Polling for active state... (Waiting for a file named '{flag_file}' to contain 'active')")
-    while True:
-        if os.path.exists(flag_file):
-            try:
-                with open(flag_file, "r") as f:
-                    content = f.read().strip().lower()
-                if content == "active":
-                    print("\n[+] Active state flag detected! Proceeding to OS selection...")
-                    break
-            except Exception:
-                pass
-        time.sleep(2)
-
 if __name__ == "__main__":
     try:
         check_and_install_dependencies()
-        wait_for_activation()
-        os_opts = select_os_menu()
-        hw_specs = get_hardware_profile()
         
-        success = run_vagrant(hw_specs, os_opts)
+        print("[*] Starting remote Hive Agent...")
+        print("[*] Environment initialized. Proceeding to websocket layer...")
         
-        if not success:
-            print("[!] VM boot failed/was interrupted. Proceeding to websocket layer anyway...")
-        else:
-            print("[+] Provisioning complete. Keeping websocket connection active...")
-            
         asyncio.run(connect_to_websocket())
     except KeyboardInterrupt:
         print("\n[!] Operation cancelled by user.")
