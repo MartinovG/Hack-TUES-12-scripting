@@ -35,7 +35,7 @@ def log(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}")
 
 
-async def run_command_in_vm(command: str) -> dict:
+def run_command_in_vm(command: str) -> dict:
     """Run a single command inside the Vagrant VM and return a structured result."""
     try:
         result = subprocess.run(
