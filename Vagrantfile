@@ -30,8 +30,9 @@ Vagrant.configure("2") do |config|
   end
 
   config.vm.synced_folder ".", "/vagrant", disabled: true
-  
-  config.vm.network "forwarded_port", guest: 22, host: 2222, id: "ssh", auto_correct: true
+
+  host_ssh_port = (ENV['HIVE_VM_SSH_PORT'] || rand(2200..65000).to_s).to_i
+  config.vm.network "forwarded_port", guest: 22, host: host_ssh_port, id: "ssh", auto_correct: true
   
   config.vm.boot_timeout = 600
 end
